@@ -128,6 +128,9 @@ fn main() -> eframe::Result {
     // OS hardware video decoders (VideoToolbox on macOS) in front of our own; Settings ▸ Playback ▸
     // Hardware decoding switches them off. Unsupported streams and failures use our decoders.
     register_hardware_decoders();
+    // A signed-in YouTube account goes to the operating system's credential store (#2626)
+    #[cfg(feature = "publish")]
+    filmcraft_engine::publish::use_system_credential_store();
     // Which graphics backends and adapter the window starts with: `--graphics`, else the saved
     // mode, which moves on after starts that died before their window painted (a driver crash),
     // see graphics.rs.

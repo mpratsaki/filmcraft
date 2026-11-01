@@ -10,19 +10,23 @@
 //! | `publish.youtube.check` | whether `publish.youtube.upload` would take these details now (account, title, description, tags), without uploading: the Export page asks before it writes a file |
 //! | `publish.youtube.upload` | a job: upload a file with its title, description, tags and privacy (private by default); with `afterJob`, once that export has written the file |
 //!
-//! Both files live in `<data dir>/publish/`: `youtube-client.json` (the client file as Google
-//! downloads it) and `youtube-account.json` (the refresh token, owner-only on Unix). The access
-//! token stays in memory. No command, job or log line shows a token or the client secret.
+//! The client file lives in `<data dir>/publish/youtube-client.json`, as Google downloads it. The
+//! signed-in account (its refresh token) is kept in the operating system's credential store when
+//! the app gives one ([`use_secret_store`]: the desktop app with the `publish` feature), else in
+//! `<data dir>/publish/youtube-account.json` (owner-only on Unix); an account file left from before
+//! moves into the store the first time it is read. The access token stays in memory. No command,
+//! job or log line shows a token or the client secret.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use filmcraft_export::Progress;
 use filmcraft_publish::http::{AVAILABLE, Transport, default_transport};
 use filmcraft_publish::oauth::{self, ClientConfig};
+use filmcraft_publish::secrets::SecretStore;
 use filmcraft_publish::youtube::{UPLOAD_SCOPE, UploadSession, Uploader, VideoMetadata};
 use filmcraft_publish::{Control, PublishError};
 use serde::{Deserialize, Serialize};
@@ -34,6 +38,8 @@ use crate::{EngineError, Result, Session};
 
 const CLIENT_FILE: &str = "youtube-client.json";
 const ACCOUNT_FILE: &str = "youtube-account.json";
+/// The credential store entry of the signed-in YouTube account.
+const ACCOUNT_KEY: &str = "youtube-account";
 const MAX_CLIENT_FILE: u64 = 64 * 1024;
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 /// The access token is refreshed this long before Google says it expires.
@@ -59,6 +65,35 @@ pub struct State {
     pub(crate) upload_url: Option<String>,
     /// Tests: [`FRESH_TOKEN`] unless set.
     pub(crate) fresh_token: Option<Duration>,
+    /// Tests: this session's credential store instead of the one given to [`use_secret_store`].
+    pub(crate) secrets: Option<Arc<dyn SecretStore>>,
+}
+
+/// The credential store accounts are kept in, given once by the app at start-up (the desktop app
+/// passes the operating system's). Without one, accounts are kept in a file.
+static SECRETS: OnceLock<Arc<dyn SecretStore>> = OnceLock::new();
+
+/// Keep signed-in accounts in `store` from now on (the first call wins).
+pub fn use_secret_store(store: Arc<dyn SecretStore>) {
+    let _ = SECRETS.set(store);
+}
+
+/// Keep signed-in accounts in the operating system's credential store when the machine has one
+/// (the desktop app at start-up). Asked on a thread of its own: reaching a Secret Service can
+/// take a moment. Until it answers, and on a machine without a store, accounts stay in a file.
+#[cfg(all(feature = "publish", not(target_family = "wasm")))]
+pub fn use_system_credential_store() {
+    use filmcraft_publish::secrets::KeychainStore;
+    let spawned = std::thread::Builder::new().name("filmcraft-credential-store".into()).spawn(|| {
+        if KeychainStore::available() {
+            use_secret_store(Arc::new(KeychainStore::new()));
+        } else {
+            log::info!("no credential store on this system: a YouTube account is kept in a file");
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("credential store not set up: {e}");
+    }
 }
 
 impl State {
@@ -87,6 +122,79 @@ fn dir(s: &Session) -> Option<PathBuf> {
     s.publish.dir.clone().or_else(|| crate::autosave::default_data_dir().map(|d| d.join("publish")))
 }
 
+/// Where this session keeps the signed-in account.
+fn accounts(s: &Session) -> Option<Accounts> {
+    let store = s.publish.secrets.clone().or_else(|| SECRETS.get().cloned());
+    dir(s).map(|dir| Accounts { dir, store })
+}
+
+/// The signed-in account's home: the credential store when there is one, else
+/// `youtube-account.json` in the publish folder (also where a failing store leaves it).
+#[derive(Clone)]
+struct Accounts {
+    dir: PathBuf,
+    store: Option<Arc<dyn SecretStore>>,
+}
+
+impl Accounts {
+    fn file(&self) -> PathBuf {
+        self.dir.join(ACCOUNT_FILE)
+    }
+
+    /// The account signed in with `client`, if any. An account file found while a store works
+    /// moves into the store.
+    fn load(&self, client: &ClientConfig) -> Option<Account> {
+        let parse = |json: &[u8]| serde_json::from_slice::<Account>(json).ok().filter(|a| a.client_id == client.client_id && !a.refresh_token.is_empty());
+        if let Some(store) = &self.store {
+            match store.get(ACCOUNT_KEY) {
+                Ok(Some(json)) => return parse(json.as_bytes()),
+                Ok(None) => {
+                    let bytes = std::fs::read(self.file()).ok()?;
+                    let moved = std::str::from_utf8(&bytes).map_err(|e| e.to_string()).and_then(|json| store.set(ACCOUNT_KEY, json));
+                    match moved {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(self.file());
+                            log::info!("YouTube account moved into the {} credential store", store.name());
+                        }
+                        Err(e) => log::warn!("YouTube account kept in its file: {e}"),
+                    }
+                    return parse(&bytes);
+                }
+                Err(e) => log::warn!("can't read the YouTube account from the {} credential store: {e}", store.name()),
+            }
+        }
+        parse(&std::fs::read(self.file()).ok()?)
+    }
+
+    /// Keep `account`: in the store (removing an old file), else in the file.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // signing in needs the desktop app
+    fn save(&self, account: &Account) -> std::result::Result<(), PublishError> {
+        let json = serde_json::to_string(account).map_err(|e| PublishError::Protocol(e.to_string()))?;
+        if let Some(store) = &self.store {
+            match store.set(ACCOUNT_KEY, &json) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(self.file());
+                    return Ok(());
+                }
+                Err(e) => log::warn!("YouTube account kept in a file: the {} credential store failed: {e}", store.name()),
+            }
+        }
+        write_private(&self.file(), json.as_bytes())?;
+        Ok(())
+    }
+
+    /// Forget the account, wherever it is, and its access token.
+    fn forget(&self, access: &Mutex<Option<Access>>) {
+        if let Some(store) = &self.store
+            && let Err(e) = store.delete(ACCOUNT_KEY)
+        {
+            log::warn!("can't remove the YouTube account from the {} credential store: {e}", store.name());
+        }
+        let _ = std::fs::remove_file(self.file());
+        *access.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
 fn load_client(s: &Session) -> std::result::Result<ClientConfig, String> {
     if let Some(client) = &s.publish.client {
         return Ok(client.clone());
@@ -94,12 +202,6 @@ fn load_client(s: &Session) -> std::result::Result<ClientConfig, String> {
     let path = dir(s).ok_or("no data directory")?.join(CLIENT_FILE);
     let bytes = std::fs::read(&path).map_err(|_| "no YouTube client yet: choose the client file from Google Cloud (publish.youtube.setClient)".to_string())?;
     ClientConfig::from_google_json(&bytes).map_err(|e| e.to_string())
-}
-
-/// The account signed in with `client`, if any.
-fn load_account(dir: &Path, client: &ClientConfig) -> Option<Account> {
-    let bytes = std::fs::read(dir.join(ACCOUNT_FILE)).ok()?;
-    serde_json::from_slice::<Account>(&bytes).ok().filter(|a| a.client_id == client.client_id && !a.refresh_token.is_empty())
 }
 
 /// Write `bytes` to `path` through a temporary file, readable only by the user on Unix (the
@@ -121,19 +223,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-fn forget_account(dir: &Path, access: &Mutex<Option<Access>>) {
-    let _ = std::fs::remove_file(dir.join(ACCOUNT_FILE));
-    *access.lock().unwrap_or_else(PoisonError::into_inner) = None;
-}
-
 fn unavailable(cmd: &str) -> EngineError {
     bad(cmd, "publishing is not available in this build (built without the `publish` feature)")
 }
 
 fn status(s: &mut Session, _: &Value) -> Result<Value> {
     let client = load_client(s).ok();
-    let signed_in = match (&client, dir(s)) {
-        (Some(client), Some(dir)) => load_account(&dir, client).is_some(),
+    let signed_in = match (&client, accounts(s)) {
+        (Some(client), Some(accounts)) => accounts.load(client).is_some(),
         _ => false,
     };
     Ok(json!({
@@ -152,18 +249,18 @@ fn set_client(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let bytes = std::fs::read(path).map_err(|e| bad(cmd, format!("can't read {path}: {e}")))?;
     let client = ClientConfig::from_google_json(&bytes).map_err(|e| bad(cmd, e.to_string()))?;
-    let dir = dir(s).ok_or_else(|| bad(cmd, "no data directory"))?;
-    write_private(&dir.join(CLIENT_FILE), &bytes).map_err(|e| bad(cmd, format!("can't keep the client file: {e}")))?;
+    let accounts = accounts(s).ok_or_else(|| bad(cmd, "no data directory"))?;
+    write_private(&accounts.dir.join(CLIENT_FILE), &bytes).map_err(|e| bad(cmd, format!("can't keep the client file: {e}")))?;
     // An account signed in through another client can't refresh through this one.
-    if load_account(&dir, &client).is_none() {
-        forget_account(&dir, &s.publish.access);
+    if accounts.load(&client).is_none() {
+        accounts.forget(&s.publish.access);
     }
     Ok(json!({"clientId": client.client_id}))
 }
 
 fn sign_out(s: &mut Session, _: &Value) -> Result<Value> {
-    if let Some(dir) = dir(s) {
-        forget_account(&dir, &s.publish.access);
+    if let Some(accounts) = accounts(s) {
+        accounts.forget(&s.publish.access);
     }
     Ok(json!({"signedIn": false}))
 }
@@ -174,23 +271,23 @@ fn sign_in(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(unavailable(cmd));
     }
     let client = load_client(s).map_err(|e| bad(cmd, e))?;
-    let dir = dir(s).ok_or_else(|| bad(cmd, "no data directory"))?;
+    let accounts = accounts(s).ok_or_else(|| bad(cmd, "no data directory"))?;
     let timeout = p
         .get("timeoutSeconds")
         .and_then(Value::as_f64)
         .filter(|t| t.is_finite() && *t > 0.0)
         .map_or(SIGN_IN_TIMEOUT, |t| Duration::from_secs_f64(t.min(3600.0)));
     let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false);
-    start_sign_in(s, cmd, client, dir, timeout, wait)
+    start_sign_in(s, cmd, client, accounts, timeout, wait)
 }
 
 #[cfg(target_family = "wasm")]
-fn start_sign_in(_: &mut Session, cmd: &str, _: ClientConfig, _: PathBuf, _: Duration, _: bool) -> Result<Value> {
+fn start_sign_in(_: &mut Session, cmd: &str, _: ClientConfig, _: Accounts, _: Duration, _: bool) -> Result<Value> {
     Err(bad(cmd, "signing in to YouTube needs the desktop app"))
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn start_sign_in(s: &mut Session, cmd: &str, client: ClientConfig, dir: PathBuf, timeout: Duration, wait: bool) -> Result<Value> {
+fn start_sign_in(s: &mut Session, cmd: &str, client: ClientConfig, accounts: Accounts, timeout: Duration, wait: bool) -> Result<Value> {
     let (sign_in, loopback) = oauth::SignIn::start(&client, UPLOAD_SCOPE).map_err(|e| bad(cmd, e.to_string()))?;
     let url = sign_in.url.clone();
     s.events.push(crate::Event::OpenUrl(url.clone()));
@@ -210,8 +307,7 @@ fn start_sign_in(s: &mut Session, cmd: &str, client: ClientConfig, dir: PathBuf,
             }
             let refresh_token = tokens.refresh_token.clone().ok_or_else(|| PublishError::SignIn("Google sent no refresh token".into()))?;
             let account = Account { client_id: client.client_id.clone(), refresh_token };
-            let bytes = serde_json::to_vec(&account).map_err(|e| PublishError::Protocol(e.to_string()))?;
-            write_private(&dir.join(ACCOUNT_FILE), &bytes)?;
+            accounts.save(&account)?;
             remember(&access, &client, &tokens);
             Ok(())
         })();
@@ -238,7 +334,7 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
             None
         }
     };
-    let (client, dir, account) = signed_in(s, cmd)?;
+    let (client, accounts, account) = signed_in(s, cmd)?;
     let wait = p.get("wait").and_then(Value::as_bool).unwrap_or(false);
     let job = new_job(s, format!("Uploading “{}” to YouTube", meta.title.trim()));
     set_status(&job.progress, if after.is_some() { WAITING_FOR_EXPORT } else { "Starting the upload" });
@@ -248,7 +344,7 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
         after,
         client,
         account,
-        dir,
+        accounts,
         upload_url: s.publish.upload_url.clone(),
         access: s.publish.access.clone(),
         fresh_token: s.publish.fresh_token.unwrap_or(FRESH_TOKEN),
@@ -261,7 +357,7 @@ fn upload(s: &mut Session, p: &Value) -> Result<Value> {
         if upload.revoked.get() {
             // Google refused the refresh token (revoked or expired): the user signs in again. A
             // 401 from the upload API alone keeps the account.
-            forget_account(&upload.dir, &upload.access);
+            upload.accounts.forget(&upload.access);
         }
         let bytes = prog.total.load(Ordering::Relaxed);
         finish(&prog, &res, r.map(|url| (format!("Uploaded to YouTube: {url}"), url)), t0, bytes);
@@ -277,11 +373,11 @@ fn metadata(p: &Value, cmd: &str) -> Result<VideoMetadata> {
 }
 
 /// The client and the signed-in account.
-fn signed_in(s: &Session, cmd: &str) -> Result<(ClientConfig, PathBuf, Account)> {
+fn signed_in(s: &Session, cmd: &str) -> Result<(ClientConfig, Accounts, Account)> {
     let client = load_client(s).map_err(|e| bad(cmd, e))?;
-    let dir = dir(s).ok_or_else(|| bad(cmd, "no data directory"))?;
-    let account = load_account(&dir, &client).ok_or_else(|| bad(cmd, "sign in to YouTube first (publish.youtube.signIn)"))?;
-    Ok((client, dir, account))
+    let accounts = accounts(s).ok_or_else(|| bad(cmd, "no data directory"))?;
+    let account = accounts.load(&client).ok_or_else(|| bad(cmd, "sign in to YouTube first (publish.youtube.signIn)"))?;
+    Ok((client, accounts, account))
 }
 
 fn check(s: &mut Session, p: &Value) -> Result<Value> {
@@ -311,7 +407,7 @@ struct Upload {
     after: Option<crate::Job>,
     client: ClientConfig,
     account: Account,
-    dir: PathBuf,
+    accounts: Accounts,
     upload_url: Option<String>,
     access: Arc<Mutex<Option<Access>>>,
     fresh_token: Duration,

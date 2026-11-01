@@ -63,9 +63,17 @@ the session address, which authorizes the upload.
 
 ## Where it is used
 
-The engine's `publish.youtube.*` commands (sign-in and upload as jobs, the account kept in the
-app's data folder) and the Export page's YouTube destination use this crate, behind the engine's
-and the app's `publish` feature (off by default).
+The engine's `publish.youtube.*` commands (sign-in and upload as jobs) and the Export page's
+YouTube destination use this crate, behind the engine's and the app's `publish` feature (off by
+default).
+
+The signed-in account (its refresh token) is kept with a [`secrets::SecretStore`]. With the
+`keychain` feature, `secrets::KeychainStore` keeps it in the operating system's credential store
+(Windows Credential Manager, macOS Keychain, a Secret Service on Linux, through the `keyring`
+crate as craft-ai-integrations and craft-anything do), giving up after 3 seconds on a locked
+keyring. The desktop app uses it when the machine has one; otherwise, and when the store fails,
+the engine keeps the account in an owner-only file in the app's data folder, and an account file
+left from before moves into the store the first time it is read.
 
 ## Limitations
 

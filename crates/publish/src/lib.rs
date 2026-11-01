@@ -17,6 +17,7 @@ pub mod http;
 pub mod oauth;
 #[cfg(test)]
 mod oauth_tests;
+pub mod secrets;
 #[cfg(test)]
 mod test_support;
 pub mod youtube;

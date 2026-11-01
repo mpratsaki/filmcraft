@@ -347,9 +347,10 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
   default), resuming after a dropped connection (`crates/publish`, `publish.youtube.*`, #2626).
 - **Missing:** the feature is off by default and each user needs their own Google Cloud OAuth
   client; no other platform (TikTok, Vimeo, Instagram…); no upload from the export queue; an
-  upload interrupted by quitting starts again; signing out doesn't revoke the token at Google;
-  the refresh token is a file in the data folder, not in the OS keychain.
-- **Estimate:** 30–60 h (official client and verification, keychain, queue, other platforms).
+  upload interrupted by quitting starts again; signing out doesn't revoke the token at Google.
+  The refresh token is in the OS credential store (Windows Credential Manager, macOS Keychain,
+  a Secret Service on Linux), or in a file in the data folder on a machine without one.
+- **Estimate:** 30–60 h (official client and verification, queue, other platforms).
 
 ## Revision history
 

@@ -563,3 +563,97 @@ fn file_types_are_named_for_youtube() {
     assert_eq!(content_type("x.mxf"), "application/octet-stream");
     assert_eq!(content_type("noext"), "application/octet-stream");
 }
+
+/// A credential store that refuses everything (a locked or missing keyring).
+struct BrokenStore;
+
+impl SecretStore for BrokenStore {
+    fn name(&self) -> &'static str {
+        "broken"
+    }
+    fn get(&self, _: &str) -> std::result::Result<Option<String>, String> {
+        Err("locked".into())
+    }
+    fn set(&self, _: &str, _: &str) -> std::result::Result<(), String> {
+        Err("locked".into())
+    }
+    fn delete(&self, _: &str) -> std::result::Result<(), String> {
+        Err("locked".into())
+    }
+}
+
+fn stored(store: &filmcraft_publish::secrets::MemoryStore) -> Option<String> {
+    store.get(ACCOUNT_KEY).unwrap()
+}
+
+/// With a credential store, a sign-in keeps the account there and writes no file; signing out
+/// removes it from the store.
+#[test]
+fn a_sign_in_keeps_the_account_in_the_credential_store() {
+    let fake = Fake::start();
+    let (mut s, dir) = session("store-sign-in");
+    let store = Arc::new(filmcraft_publish::secrets::MemoryStore::default());
+    s.publish.secrets = Some(store.clone());
+    s.publish.client = Some(fake.client());
+    let r = s.execute("publish.youtube.signIn", json!({})).unwrap();
+    let url = r["url"].as_str().unwrap().to_string();
+    fake.g(|g| g.challenge = param(url.split_once('?').unwrap().1, "code_challenge"));
+    browser_returns(&url, "4%2Fgood").join().unwrap();
+    assert_eq!(finished(&s, r["job"].as_u64().unwrap())["status"], "Signed in to YouTube");
+    let account = stored(&store).expect("the account is in the store");
+    assert!(account.contains("1//fresh") && account.contains(CLIENT_ID));
+    assert!(!dir.join("publish").join(ACCOUNT_FILE).exists(), "no account file");
+    assert_eq!(s.execute("publish.youtube.status", json!({})).unwrap()["signedIn"], true);
+    assert_eq!(s.execute("publish.youtube.signOut", json!({})).unwrap()["signedIn"], false);
+    assert_eq!(stored(&store), None, "signed out: gone from the store");
+}
+
+/// An account file from before the store moves into it the first time it is read, and the
+/// upload refreshes through the stored account.
+#[test]
+fn an_account_file_moves_into_the_credential_store() {
+    let fake = Fake::start();
+    let (mut s, dir) = signed_in("store-move", &fake);
+    let store = Arc::new(filmcraft_publish::secrets::MemoryStore::default());
+    s.publish.secrets = Some(store.clone());
+    assert_eq!(s.execute("publish.youtube.status", json!({})).unwrap()["signedIn"], true);
+    assert!(stored(&store).is_some_and(|a| a.contains("1//stored")), "moved into the store");
+    assert!(!dir.join("publish").join(ACCOUNT_FILE).exists(), "the file is gone");
+    let (path, _) = video(&dir, 1000);
+    let r = s.execute("publish.youtube.upload", json!({"path": path, "title": "Trip", "wait": true})).unwrap();
+    assert!(finished(&s, r["job"].as_u64().unwrap())["result"]["path"].is_string());
+    fake.g(|g| assert_eq!(g.refreshes, 1, "refreshed with the stored token"));
+}
+
+/// A store that fails leaves the account in its file: nothing is lost and uploads go on.
+#[test]
+fn a_failing_credential_store_keeps_the_account_file() {
+    let fake = Fake::start();
+    let (mut s, dir) = signed_in("store-broken", &fake);
+    s.publish.secrets = Some(Arc::new(BrokenStore));
+    assert_eq!(s.execute("publish.youtube.status", json!({})).unwrap()["signedIn"], true);
+    assert!(dir.join("publish").join(ACCOUNT_FILE).exists(), "the file stays");
+    let accounts = accounts(&s).unwrap();
+    accounts.save(&Account { client_id: CLIENT_ID.into(), refresh_token: "1//again".into() }).unwrap();
+    let file = std::fs::read_to_string(dir.join("publish").join(ACCOUNT_FILE)).unwrap();
+    assert!(file.contains("1//again"), "saved to the file when the store fails");
+    assert_eq!(s.execute("publish.youtube.signOut", json!({})).unwrap()["signedIn"], false);
+    assert!(!dir.join("publish").join(ACCOUNT_FILE).exists());
+}
+
+/// A revoked account is forgotten from the store too.
+#[test]
+fn a_revoked_account_is_forgotten_from_the_credential_store() {
+    let fake = Fake::start();
+    fake.g(|g| g.revoked = true);
+    let (mut s, dir) = session("store-revoked");
+    let store = Arc::new(filmcraft_publish::secrets::MemoryStore::default());
+    store.set(ACCOUNT_KEY, &json!({"clientId": CLIENT_ID, "refreshToken": "1//stored"}).to_string()).unwrap();
+    s.publish.secrets = Some(store.clone());
+    s.publish.client = Some(fake.client());
+    s.publish.upload_url = Some(format!("{}/upload/youtube/v3/videos", fake.base));
+    let (path, _) = video(&dir, 1000);
+    let r = s.execute("publish.youtube.upload", json!({"path": path, "title": "Trip", "wait": true})).unwrap();
+    assert_eq!(finished(&s, r["job"].as_u64().unwrap())["result"]["error"], "the account needs to sign in again");
+    assert_eq!(stored(&store), None);
+}
